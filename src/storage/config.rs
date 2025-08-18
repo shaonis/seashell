@@ -21,6 +21,7 @@ use crate::{
 #[derive(Default, Deserialize, Serialize)]
 pub struct Config {
     #[serde(flatten)]
+    #[serde(deserialize_with = "empty_scope_is_none")]
     pub default: Option<Scope>,
     pub scopes: IndexMap<String, Scope>,
     pub servers: IndexMap<String, ServerEntry>,
@@ -53,8 +54,16 @@ pub struct Scope {
 #[serde(untagged)]
 pub enum ServerEntry {
     #[default]
-    Global(Server),
+    Global(ScopedServer),
     Scope(IndexMap<String, ScopedServer>),
+}
+
+#[derive(Debug, Deserialize, Serialize, SmartDefault)]
+#[serde(untagged)]
+pub enum ScopedServer {
+    #[default]
+    Address(String),
+    Override(Server),
 }
 
 #[skip_serializing_none]
@@ -65,14 +74,6 @@ pub struct Server {
     #[command(flatten)]
     #[serde(flatten)]
     pub scope: Scope,
-}
-
-#[derive(Debug, Deserialize, Serialize, SmartDefault)]
-#[serde(untagged)]
-pub enum ScopedServer {
-    #[default]
-    Address(String),
-    Override(Server),
 }
 
 impl Config {
@@ -197,6 +198,12 @@ impl StorageProvider for Config {
     }
 }
 
+impl Scope {
+    pub fn is_empty(&self) -> bool {
+        *self == Scope::default()
+    }
+}
+
 impl Server {
     pub fn new(address: String) -> Self {
         Self { address, ..Default::default() }
@@ -207,7 +214,7 @@ impl Server {
     }
 
     pub fn is_only_address(&self) -> bool {
-        self.scope == Scope::default()
+        self.scope.is_empty()
     }
 
     pub fn apply_host_placeholder(&mut self, host: &str) {
@@ -240,6 +247,17 @@ impl From<ScopedServer> for Server {
     }
 }
 
+// serde makes default: Some(...), even though all Scope fields are None
+fn empty_scope_is_none<'de, D>(deserializer: D) -> Result<Option<Scope>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    match Option::<Scope>::deserialize(deserializer)? {
+        Some(s) if s.is_empty() => Ok(None),
+        other => Ok(other),
+    }
+}
+
 #[inline]
 fn add_global_server(
     servers: &mut IndexMap<String, ServerEntry>,
@@ -253,6 +271,11 @@ fn add_global_server(
         };
         return Err(err.into())
     }
+    let server = if server.is_only_address() {
+        ScopedServer::Address(server.address)
+    } else {
+        ScopedServer::Override(server)
+    };
     servers.insert(name, ServerEntry::Global(server));
 
     Ok(())
@@ -302,7 +325,7 @@ mod tests {
         let (scope1, scope2) = (String::from("scope1"), String::from("scope2"));
         // All
         cfg.servers.insert(host1.clone(), ServerEntry::default());
-        cfg.servers.insert(host2.clone(), ServerEntry::Global(Server::default()));
+        cfg.servers.insert(host2.clone(), ServerEntry::default());
 
         let res = cfg.list("".into(), true, false);
         assert!(matches!(res, Ok(LsResult::All(_))));

@@ -51,7 +51,6 @@ fn handle_server_connection(mut server_uri: ServerUri, conn_flags: Scope) -> Res
         server,
         config.default.unwrap_or_default(),
     )?;
-    println!("{:?}", data);
     let rt  = Runtime::new()?;
     rt.block_on(establish_connection(data))?;
 
@@ -172,13 +171,14 @@ fn resolve_server(host: &str, config: &mut Config, current_scope: String) -> Res
     }
     // Search for the server in the global scope
     if let Some(ServerEntry::Global(server)) = config.servers.get_mut(host) {
-        return Ok(Some(mem::take(server)));
+        return Ok(Some(mem::take(server).into()));
     }
     for (pattern, entry) in config.servers.iter_mut() {
         if let ServerEntry::Global(server) = entry {
             if Regex::new(pattern)?.is_match(host) {
+                let mut server: Server = mem::take(server).into();
                 server.apply_host_placeholder(host);
-                return Ok(Some(mem::take(server)))
+                return Ok(Some(server))
             }
         }
     }

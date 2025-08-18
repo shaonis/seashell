@@ -8,7 +8,7 @@ use crate::{
     },
 };
 
-
+/// Represents the data required to establish a connection to a server
 #[derive(Debug, Clone)]
 pub struct ConnectionData {
     pub address: String,
@@ -19,6 +19,7 @@ pub struct ConnectionData {
     pub openssh_cert: Option<PathBuf>,
 }
 
+/// URI format: [user@]host[:port]
 #[derive(Debug, Clone)]
 pub struct ServerUri {
     pub address: String,
@@ -35,10 +36,12 @@ impl FromStr for ServerUri {
             None => (None, input),
         };
         let (address, port) = match host_port.rfind(':') {
-            Some(i) if host_port[i+1..].parse::<u16>().is_ok() => {
-                let p = host_port[i+1..].parse().unwrap();
-                (host_port[..i].to_string(), Some(p))
-            }
+            Some(i) => {
+                match host_port[i+1..].parse::<u16>() {
+                    Ok(p) => (host_port[..i].to_string(), Some(p)),
+                    Err(_) => (host_port.to_string(), None),
+                }
+            },
             _ => (host_port.to_string(), None),
         };
 
