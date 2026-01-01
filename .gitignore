@@ -1,3 +1,5 @@
-.idea/
+# IDE
+.idea
+.vscode
+# Cargo
 target/
-Cargo.lock

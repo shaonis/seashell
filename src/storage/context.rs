@@ -1,4 +1,4 @@
-use std::cell::LazyCell;
+use std::sync::LazyLock;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
@@ -8,32 +8,36 @@ use crate::{
     storage::provider::{CACHE_PATH, StorageProvider},
 };
 
-
 #[derive(Serialize, Deserialize, Debug, Default)]
 pub struct Context {
     current_scope: String,
 }
 
 impl Context {
-    pub fn scope(&self) -> &String {
+    pub fn scope(&self) -> &str {
         &self.current_scope
     }
-    
+
     pub fn into_scope(self) -> String {
         self.current_scope
     }
-    
+
     pub fn change_scope(mut self, scope: Option<String>) -> Self {
         if let Some(scope) = scope {
             self.current_scope = scope;
+        } else {
+            self.current_scope.clear();
         }
-        else { self.current_scope.clear(); }
+
         self
     }
 }
 
 impl StorageProvider for Context {
-    const WORK_FILE: LazyCell<Box<str>> = CACHE_PATH;
+    #[inline]
+    fn work_file() -> &'static LazyLock<Box<str>> {
+        &CACHE_PATH
+    }
 
     fn serialize(&self) -> Result<String> {
         Ok(serde_json::to_string(self).map_err(FileError::Json)?)
@@ -51,7 +55,9 @@ mod tests {
 
     #[test]
     fn scope_and_into_scope() {
-        let ctx = Context { current_scope: "test".into() };
+        let ctx = Context {
+            current_scope: "test".into(),
+        };
         assert_eq!(ctx.scope(), "test");
         assert_eq!(ctx.into_scope(), "test");
     }
@@ -66,7 +72,9 @@ mod tests {
 
     #[test]
     fn serialize_deserialize() {
-        let ctx = Context { current_scope: "test".into() };
+        let ctx = Context {
+            current_scope: "test".into(),
+        };
         if let Ok(serialized) = StorageProvider::serialize(&ctx) {
             assert_eq!(serialized, r#"{"current_scope":"test"}"#);
             let deserialized: Result<Context> = StorageProvider::deserialize(&serialized);

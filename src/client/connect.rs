@@ -1,170 +1,445 @@
-use std::{
-    env,
-    io::Write,
-    net::{IpAddr, SocketAddr},
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
-};
-
 use anyhow::Result;
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-use russh::{
-    Channel, ChannelMsg,
-    client::{self, Config, Handle, Handler, Msg},
-    keys::{
-        load_openssh_certificate,
-        load_secret_key,
-        ssh_key,
-        HashAlg,
-        PrivateKey,
-        PrivateKeyWithHashAlg,
-        PublicKey,
-        PublicKeyBase64,
-    },
+use crossterm::terminal::{self, disable_raw_mode, enable_raw_mode};
+use log::info;
+use russh::client::{AuthResult, Handle, KeyboardInteractiveAuthResponse, Msg};
+use russh::keys::agent::client::AgentClient;
+use russh::keys::{
+    HashAlg, PrivateKey, PrivateKeyWithHashAlg, load_openssh_certificate, load_secret_key, ssh_key,
 };
-use tokio::{fs, io::{AsyncReadExt, AsyncWriteExt}, net::lookup_host};
+use russh::{Channel, ChannelMsg, MethodKind};
+use secrecy::{ExposeSecret, SecretString};
+use std::io::Write;
+use std::mem;
+use std::net::SocketAddr;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::lookup_host;
 
-use crate::{
-    client::data::ConnectionData,
-    error::{ConnectionError, FileError, SessionError},
-};
+use crate::client::data::ConnectionData;
+use crate::client::handler::ClientHandler;
+use crate::error::{ConnectionError, FileError, SessionError};
 
+const MAX_PASSPHRASE_ATTEMPTS: u8 = 3;
+const DEFAULT_TERM: &str = "xterm";
+const SESSION_BUFFER_SIZE: usize = 4096;
+const RESIZE_INTERVAL_MS: u64 = 200;
+const STDIN_FD: i32 = 0;
+const STDOUT_FD: i32 = 1;
 
-pub async fn establish_connection(data: ConnectionData) -> Result<()> {
-    // Maybe not a socket
-    let sock = format!("{}:{}", data.address, data.port);
-    let socket: SocketAddr;
-    if let Ok(s) = sock.parse::<SocketAddr>() {
-        socket = s;
+// Single point of entry for the module
+pub async fn initiate_connection(data: ConnectionData) -> Result<()> {
+    let mut conn = Connection::new(data).await?;
+    conn.establish().await?;
+    conn.authenticate().await?;
+
+    if let Some(cmd) = conn.data.remote_cmd.as_ref() {
+        conn.execute_command(cmd).await?;
     } else {
-        socket = lookup_host(sock)
-            .await
-            .map_err(ConnectionError::Dns)?
-            .next()
-            .expect("address should be resolved");
+        conn.start_interactive().await?;
     }
 
-    let handler = ClientHandler::new(
-        socket.ip(),
-        data.known_hosts.clone(),
-    );
-    let config = Config {
-        inactivity_timeout: Some(Duration::from_secs(300)),
-        keepalive_interval: Some(Duration::from_secs(60)),
-        keepalive_max: 3,
-        ..Default::default()
-    };
-    let mut session = client::connect(Arc::new(config), socket, handler).await?;
-    auth_session(&data, &mut session).await?;
-    let mut channel = session.channel_open_session().await?;
-    adjust_terminal(&mut channel).await?;
-    let result = run_session(&mut channel).await;
-    println!("Connection to {} closed.", socket.ip());
+    Ok(())
+}
 
-    result
+// Represents an SSH connection
+struct Connection {
+    data: ConnectionData,
+    socket: SocketAddr,
+    session: Option<Handle<ClientHandler>>,
+}
+
+macro_rules! session {
+    ($self:expr) => {
+        $self.session.as_ref().expect("should be connected")
+    };
+    (mut $self:expr) => {
+        $self.session.as_mut().expect("should be connected")
+    };
+}
+
+macro_rules! prompt {
+    (echo => $($arg:tt)*) => {{
+        print!("{}: ", format_args!($($arg)*));
+        std::io::stdout().flush()?;
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        input.trim().to_string()
+    }};
+    ($($arg:tt)*) => {{
+        print!("{}: ", format_args!($($arg)*));
+        std::io::stdout().flush()?;
+        SecretString::from(rpassword::read_password()?)
+    }};
+}
+
+impl Connection {
+    async fn new(data: ConnectionData) -> Result<Self> {
+        // Maybe not a socket (domain:port)
+        let sock = format!("{}:{}", data.address, data.port);
+        let socket = if let Ok(s) = sock.parse() {
+            s
+        } else {
+            info!("Resolving address '{}'...", data.address);
+
+            lookup_host(sock)
+                .await
+                .map_err(ConnectionError::Dns)?
+                .next()
+                .expect("address should be resolved")
+        };
+
+        Ok(Self {
+            data,
+            socket,
+            session: None,
+        })
+    }
+
+    async fn establish(&mut self) -> Result<()> {
+        let handler = ClientHandler::new(self.socket.ip(), mem::take(&mut self.data.known_hosts));
+        let config = Arc::new(mem::take(&mut self.data.config));
+
+        info!(
+            "Connecting to {}:{}...",
+            self.socket.ip(),
+            self.socket.port()
+        );
+
+        self.session = russh::client::connect(config, self.socket, handler)
+            .await
+            .map_err(SessionError::Connect)?
+            .into();
+
+        Ok(())
+    }
+
+    async fn authenticate(&mut self) -> Result<()> {
+        info!("Trying none/hostbased authentication...");
+
+        let session = session!(mut self);
+        let allowed_methods = match session.authenticate_none(&self.data.user).await {
+            Ok(AuthResult::Success) => return Ok(()),
+            Ok(AuthResult::Failure {
+                remaining_methods, ..
+            }) => remaining_methods,
+            Err(_) => return Err(SessionError::AuthUnavailable.into()),
+        };
+        info!(
+            "Authorization required. Allowed methods: {:?}",
+            allowed_methods
+        );
+
+        for method in allowed_methods.iter() {
+            let authenticated = match method {
+                MethodKind::PublicKey => {
+                    let hash_alg = session!(self)
+                        .best_supported_rsa_hash()
+                        .await?
+                        .unwrap_or(Some(HashAlg::default()));
+
+                    self.try_agent_auth(hash_alg).await?
+                        || self.try_certificate_auth().await?
+                        || self.try_publickey_auth(hash_alg).await?
+                }
+                MethodKind::KeyboardInteractive => self.try_keyboard_interactive_auth().await?,
+                MethodKind::Password => self.try_password_auth().await?,
+                _ => continue,
+            };
+            if authenticated {
+                return Ok(());
+            }
+        }
+        let allowed_methods = allowed_methods
+            .iter()
+            .map(Into::into)
+            .collect::<Vec<String>>()
+            .join(", ");
+
+        Err(SessionError::AuthFailed(allowed_methods).into())
+    }
+
+    async fn execute_command(&self, command: &str) -> Result<()> {
+        info!("Executing command '{}'...", command);
+
+        let session = session!(self);
+        let mut channel = session.channel_open_session().await?;
+        channel.exec(true, command).await?;
+
+        let mut stdout = tokio::io::stdout();
+        while let Some(msg) = channel.wait().await {
+            match msg {
+                ChannelMsg::Data { data } => {
+                    stdout.write_all(&data).await?;
+                    stdout.flush().await?;
+                }
+                ChannelMsg::ExitStatus { exit_status: _ } => break,
+                _ => {}
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn start_interactive(&mut self) -> Result<()> {
+        info!("Preparing interactive session...");
+
+        let session = session!(mut self);
+        let mut channel = session.channel_open_session().await?;
+
+        let (width, height) = terminal::size().map_err(FileError::Std)?;
+        let term = std::env::var("TERM").unwrap_or(DEFAULT_TERM.into());
+
+        channel
+            .request_pty(false, &term, width.into(), height.into(), 0, 0, &[])
+            .await
+            .map_err(SessionError::Terminal)?;
+
+        channel
+            .request_shell(true)
+            .await
+            .map_err(SessionError::Terminal)?;
+
+        let result = run_session(&mut channel).await;
+        println!("Connection to {} closed.", self.socket.ip());
+
+        result
+    }
+
+    async fn try_agent_auth(&mut self, hash_alg: Option<HashAlg>) -> Result<bool> {
+        info!("Trying SSH agent authentication...");
+
+        let Ok(mut agent) = AgentClient::connect_env().await else {
+            info!("SSH agent not available (environment variable 'SSH_AUTH_SOCK' not set)");
+            return Ok(false);
+        };
+        let mut pub_keys = agent.request_identities().await?;
+
+        if pub_keys.is_empty() {
+            info!("No keys found in SSH agent");
+            return Ok(false);
+        }
+        // Prioritize keys matching user/address
+        pub_keys.sort_by_key(|key| {
+            let comment = key.comment();
+            let matches = comment.contains(&self.data.address) || comment.contains(&self.data.user);
+            !matches
+        });
+        let session = session!(mut self);
+
+        for key in pub_keys {
+            if session
+                .authenticate_publickey_with(&self.data.user, key, hash_alg, &mut agent)
+                .await
+                .is_ok()
+            {
+                info!("SSH agent authentication succeeded");
+                return Ok(true);
+            }
+        }
+        info!("SSH agent authentication failed (approval for use may be required)");
+
+        Ok(false)
+    }
+
+    async fn try_certificate_auth(&mut self) -> Result<bool> {
+        info!("Trying OpenSSH certificate authentication...");
+
+        let (key_path, cert_path) = match (&self.data.private_key, &self.data.openssh_cert) {
+            (Some(k), Some(c)) => (k, c),
+            _ => {
+                info!("OpenSSH certificate or private key not provided");
+                return Ok(false);
+            }
+        };
+        let key = load_private_key(key_path).map_err(SessionError::PrivateKey)?;
+        let cert = load_openssh_certificate(cert_path).map_err(SessionError::OpenSSHCert)?;
+
+        let session = session!(mut self);
+
+        session
+            .authenticate_openssh_cert(&self.data.user, Arc::new(key), cert)
+            .await
+            .map_err(SessionError::OpenSSHCertAuth)?;
+
+        info!("OpenSSH certificate authentication succeeded");
+
+        Ok(true)
+    }
+
+    async fn try_publickey_auth(&mut self, hash_alg: Option<HashAlg>) -> Result<bool> {
+        info!("Trying public key authentication...");
+
+        let key_path = match &self.data.private_key {
+            Some(k) => k,
+            None => {
+                info!("No private key provided");
+                return Ok(false);
+            }
+        };
+        let key = load_private_key(key_path).map_err(SessionError::PrivateKey)?;
+        let pair = PrivateKeyWithHashAlg::new(Arc::new(key), hash_alg);
+
+        let session = session!(mut self);
+
+        session
+            .authenticate_publickey(&self.data.user, pair)
+            .await
+            .map_err(SessionError::PubKeyAuth)?;
+
+        info!("Public key authentication succeeded");
+
+        Ok(true)
+    }
+
+    async fn try_keyboard_interactive_auth(&mut self) -> Result<bool> {
+        info!("Trying keyboard-interactive authentication...");
+
+        let session = session!(mut self);
+        let mut response = session
+            .authenticate_keyboard_interactive_start(&self.data.user, None)
+            .await
+            .map_err(SessionError::KeyboardInteractive)?;
+
+        loop {
+            match response {
+                KeyboardInteractiveAuthResponse::Success => {
+                    info!("Keyboard-interactive authentication succeeded");
+                    return Ok(true);
+                }
+                KeyboardInteractiveAuthResponse::Failure { .. } => {
+                    info!("Keyboard-interactive authentication failed");
+                    return Ok(false);
+                }
+                KeyboardInteractiveAuthResponse::InfoRequest {
+                    name,
+                    instructions,
+                    prompts,
+                } => {
+                    info!("Keyboard-interactive authentication request received");
+
+                    if !name.is_empty() {
+                        println!("{}", name);
+                    }
+                    if !instructions.is_empty() {
+                        println!("\n{}", instructions);
+                    }
+                    let mut responses = Vec::new();
+                    for prompt in prompts {
+                        let answer = if prompt.echo {
+                            prompt!(echo => "{}", prompt.prompt)
+                        } else {
+                            prompt!("{}", prompt.prompt).expose_secret().into()
+                        };
+
+                        responses.push(answer);
+                    }
+                    response = session
+                        .authenticate_keyboard_interactive_respond(responses)
+                        .await
+                        .map_err(SessionError::KeyboardInteractive)?;
+
+                    info!("Keyboard-interactive authentication response sent");
+                }
+            }
+        }
+    }
+
+    async fn try_password_auth(&mut self) -> Result<bool> {
+        info!("Trying password authentication...");
+
+        let session = session!(mut self);
+        let password = prompt!("{}@{}'s password", self.data.user, self.data.address);
+
+        session
+            .authenticate_password(&self.data.user, password.expose_secret())
+            .await
+            .map_err(SessionError::PasswordAuth)?;
+
+        info!("Password authentication succeeded");
+
+        Ok(true)
+    }
 }
 
 #[inline]
-fn get_private_key(key_path: &Path) -> Result<PrivateKey, russh::keys::Error> {
-    // Try without passphrase
+fn load_private_key(key_path: &Path) -> Result<PrivateKey, russh::keys::Error> {
+    info!(
+        "Trying to load private key from '{}'...",
+        key_path.display()
+    );
+
     match load_secret_key(key_path, None) {
-        Ok(key) => return Ok(key),
-        Err(russh::keys::Error::KeyIsEncrypted) => {},
+        Ok(key) => {
+            info!("Private key loaded successfully (without passphrase)");
+            return Ok(key);
+        }
+        Err(russh::keys::Error::KeyIsEncrypted) => {}
         Err(e) => return Err(e),
     }
+    info!("Private key is encrypted, prompting for passphrase...");
+
     let key_path_display = key_path.display();
-    loop {
-        print!("Enter passphrase for key '{key_path_display}': ");
-        std::io::stdout().flush()?;
-        let passphrase = rpassword::read_password()?;
-        match load_secret_key(key_path, Some(&passphrase)) {
-            Ok(key) => return Ok(key),
+    for _ in 1..=MAX_PASSPHRASE_ATTEMPTS {
+        let passphrase = prompt!("Enter passphrase for key '{key_path_display}'");
+
+        match load_secret_key(key_path, Some(passphrase.expose_secret())) {
+            Ok(key) => {
+                info!("Private key loaded successfully");
+                return Ok(key);
+            }
             Err(russh::keys::Error::SshKey(ssh_key::Error::Crypto)) => continue,
             Err(e) => return Err(e),
         }
     }
+    info!(
+        "Maximum passphrase attempts reached ({}), failed to load private key",
+        MAX_PASSPHRASE_ATTEMPTS
+    );
+
+    Err(russh::keys::Error::SshKey(ssh_key::Error::Crypto))
 }
 
-async fn auth_session(data: &ConnectionData, session: &mut Handle<ClientHandler>) -> Result<()> {
-    // Certificate
-    if let (Some(key_path), Some(cert_path)) = (&data.private_key, &data.openssh_cert) {
-        let key = get_private_key(key_path).map_err(SessionError::PrivateKey)?;
-        let cert = load_openssh_certificate(cert_path).map_err(SessionError::OpenSSHCert)?;
-        session.authenticate_openssh_cert(&data.user, Arc::new(key), cert)
-            .await
-            .map_err(SessionError::OpenSSHCertAuth)?;
+struct RawModeGuard;
 
-        return Ok(())
+impl RawModeGuard {
+    fn new() -> Result<Self> {
+        enable_raw_mode()?;
+        Ok(Self)
     }
-    // Public key
-    if let Some(key_path) = &data.private_key {
-        let key = get_private_key(key_path).map_err(SessionError::PrivateKey)?;
-        let hash_alg = session.best_supported_rsa_hash()
-            .await?
-            .unwrap_or(Some(HashAlg::default()));
-
-        let pair = PrivateKeyWithHashAlg::new(Arc::new(key), hash_alg);
-        session.authenticate_publickey(&data.user, pair)
-            .await
-            .map_err(SessionError::PubKeyAuth)?;
-
-        return Ok(())
-    }
-    // Password
-    print!("{}@{}'s password: ", data.user, data.address);
-    std::io::stdout().flush()?;
-    let password = rpassword::read_password()?;
-    session.authenticate_password(&data.user, password)
-        .await
-        .map_err(SessionError::PasswordAuth)?;
-
-    Ok(())
 }
 
-async fn adjust_terminal(channel: &mut Channel<Msg>) -> Result<()> {
-    let (width, height) = crossterm::terminal::size().map_err(FileError::from)?;
-    let term = env::var("TERM").unwrap_or_else(|_| "xterm".into());
-    channel
-        .request_pty(false, &term, width.into(), height.into(), 0, 0, &[])
-        .await
-        .map_err(SessionError::Terminal)?;
-
-    channel
-        .request_shell(true)
-        .await
-        .map_err(SessionError::Terminal)?;
-
-    Ok(())
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+    }
 }
 
 async fn run_session(channel: &mut Channel<Msg>) -> Result<()> {
-    // Async stdin/stdout
-    let mut stdin = tokio_fd::AsyncFd::try_from(0)?;
-    let mut stdout = tokio_fd::AsyncFd::try_from(1)?;
-    // Buffer
-    let mut buf = [0u8; 4096];
-    let mut stdin_closed = false;
-    // For terminal dynamic resizing
-    let (mut width, mut height) = crossterm::terminal::size()?;
-    let mut resize_check = tokio::time::interval(Duration::from_millis(200));
+    let mut stdin = tokio_fd::AsyncFd::try_from(STDIN_FD)?;
+    let mut stdout = tokio_fd::AsyncFd::try_from(STDOUT_FD)?;
 
-    enable_raw_mode()?;
+    let mut buf = [0u8; SESSION_BUFFER_SIZE];
+    let mut stdin_closed = false;
+
+    let (mut width, mut height) = terminal::size()?;
+    let mut resize_check = tokio::time::interval(Duration::from_millis(RESIZE_INTERVAL_MS));
+
+    let _guard = RawModeGuard::new()?;
 
     loop {
         tokio::select! {
-            // Read from stdin and forward to channel
             outgoing = stdin.read(&mut buf), if !stdin_closed => {
                 match outgoing {
                     Ok(0) => {
                         stdin_closed = true;
                         _ = channel.eof().await;
-                    },
+                    }
                     Ok(n) => channel.data(&buf[..n]).await?,
                     Err(e) => return Err(e.into()),
-                };
-            },
-            // Process incoming channel messages
+                }
+            }
             incoming = channel.wait() => {
                 if let Some(msg) = incoming {
                     match msg {
@@ -176,131 +451,22 @@ async fn run_session(channel: &mut Channel<Msg>) -> Result<()> {
                             if !stdin_closed {
                                 _ = channel.eof().await;
                             }
-                            break
+                            break;
                         }
                         _ => {}
                     }
                 } else {
-                    // Channel closed
-                    break
+                    break;
                 }
-            },
-            // Handle terminal resizing
+            }
             _ = resize_check.tick() => {
-                if let Ok((w, h)) = crossterm::terminal::size() {
-                    if (w, h) != (width, height) {
-                        (width, height) = (w, h);
-                        channel.window_change(w.into(), h.into(), 0, 0).await?;
-                    }
+                if let Ok((w, h)) = terminal::size() && (w, h) != (width, height) {
+                    (width, height) = (w, h);
+                    channel.window_change(w.into(), h.into(), 0, 0).await?;
                 }
-            },
+            }
         }
     }
-    disable_raw_mode()?;
 
     Ok(())
-}
-
-#[derive(Debug)]
-struct ClientHandler {
-    server_ip: IpAddr,
-    known_hosts: PathBuf,
-}
-
-impl Handler for ClientHandler {
-    type Error = anyhow::Error;
-
-    async fn check_server_key(
-        &mut self,
-        server_public_key: &PublicKey,
-    ) -> Result<bool, Self::Error> {
-        // Ensure known_hosts exists
-        if !self.known_hosts.exists() {
-            if let Some(parent) = self.known_hosts.parent() {
-                fs::create_dir_all(parent).await.map_err(FileError::from)?;
-            }
-            fs::write(&self.known_hosts, "").await.map_err(FileError::from)?;
-        }
-        let (server_ip, key_alg, key_b64) = (
-            self.server_ip.to_string(),
-            server_public_key.algorithm(),
-            server_public_key.public_key_base64(),
-        );
-        let content = fs::read_to_string(&self.known_hosts).await.map_err(FileError::from)?;
-        if content.lines().any(|line| self.is_valid_entry(line, &server_ip, key_alg.as_str(), &key_b64)) {
-            return Ok(true);
-        }
-
-        self.handle_unknown_host(server_public_key).await
-    }
-}
-
-impl ClientHandler {
-    fn new(server_ip: IpAddr, known_hosts: PathBuf) -> Self {
-        Self { server_ip, known_hosts }
-    }
-
-    fn is_valid_entry(&self, line: &str, server_ip: &str, key_alg: &str, key_b64: &str) -> bool {
-        if line.trim_start().starts_with('#') {
-            return false
-        }
-        let mut parts = line.split_whitespace();
-        if [
-            parts.next().map(|host| host == server_ip),
-            parts.next().map(|alg| alg == key_alg),
-            parts.next().map(|b64| b64 == key_b64),
-        ]
-            .into_iter()
-            .all(|x| x.unwrap_or(false))
-        {
-            return true
-        }
-
-        false
-    }
-
-    async fn handle_unknown_host(&self, key: &PublicKey) -> Result<bool> {
-        let key_alg = key.algorithm();
-        let fingerprint = key.fingerprint(HashAlg::default());
-
-        print!(
-            "The authenticity of host '{}' can't be established.\n\
-            {} key fingerprint is SHA256:{}.\n\
-            This key is not known by any other names.\n\
-            Are you sure you want to continue connecting (yes/no/[fingerprint])? ",
-            self.server_ip,
-            key_alg,
-            fingerprint,
-        );
-        std::io::stdout().flush()?;
-
-        let mut input = String::new();
-        std::io::stdin().read_line(&mut input).map_err(FileError::from)?;
-        let input = input.trim();
-
-        if input.eq_ignore_ascii_case("yes") || input.as_bytes() == fingerprint.as_bytes() {
-            self.trust_host(key).await?;
-            println!(
-                "Warning: Permanently added '{}' ({}) to the list of known hosts.",
-                self.server_ip, key_alg,
-            );
-            return Ok(true)
-        }
-
-        Ok(false)
-    }
-
-    async fn trust_host(&self, key: &PublicKey) -> Result<()> {
-        let entry = format!(
-            "{} {} {}\n",
-            self.server_ip,
-            key.algorithm(),
-            key.public_key_base64()
-        );
-        fs::write(&self.known_hosts, entry)
-            .await
-            .map_err(FileError::from)?;
-
-        Ok(())
-    }
 }

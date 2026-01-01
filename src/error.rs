@@ -1,8 +1,15 @@
 use thiserror::Error;
 
-
 #[derive(Error, Debug)]
 pub enum CliError {
+    #[error("Host must be specified")]
+    HostMissing,
+    #[error("User must be specified when '@' is present")]
+    UserMissing,
+    #[error("Port must be a number specified after ':'")]
+    PortMissing,
+    #[error("Invalid IPv6: {0}")]
+    InvalidIPv6(&'static str),
     #[error("Server '{0}' not found")]
     ServerNotFound(Box<str>),
     #[error("Scope '{0}' not found")]
@@ -28,13 +35,15 @@ pub enum ConnectionError {
     #[error("No user is specified for the server (hint: check the config file)")]
     UserRequired,
     #[error("Bad regular expression: {0} (hint: check the config file)")]
-    Regex(#[from] regex::Error),
+    Regex(#[from] regex_lite::Error),
     #[error("DNS resolution error: {0}")]
     Dns(#[from] std::io::Error),
 }
 
 #[derive(Error, Debug)]
 pub enum SessionError {
+    #[error("Failed to connect to server: {0}")]
+    Connect(#[from] anyhow::Error),
     #[error("Problem with SSH private key: {0}")]
     PrivateKey(#[source] russh::keys::Error),
     #[error("Problem with OpenSSH certificate: {0}")]
@@ -45,6 +54,12 @@ pub enum SessionError {
     PubKeyAuth(#[source] russh::Error),
     #[error("Failed to authenticate with password: {0}")]
     PasswordAuth(#[source] russh::Error),
+    #[error("Failed to authenticate with keyboard-interactive: {0}")]
+    KeyboardInteractive(#[source] russh::Error),
+    #[error("No authentication methods available")]
+    AuthUnavailable,
+    #[error("Authentication failed, available methods: {0}")]
+    AuthFailed(String),
     #[error("Failed to adjust terminal: {0}")]
     Terminal(#[source] russh::Error),
 }
