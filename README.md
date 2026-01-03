@@ -258,8 +258,6 @@ You can see that regular expressions and the placeholder `$h` are used here. Ins
 - The project is also **open to pull requests**
 - The author works on the project when he has the desire and time
 
-### Ideas
-
 ## TODO
 
 - **TUI** — terminal user interface for easier server management
